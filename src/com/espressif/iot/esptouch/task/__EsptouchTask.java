@@ -1,13 +1,20 @@
 package com.espressif.iot.esptouch.task;
 
+import java.net.InetAddress;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import com.espressif.iot.esptouch.EsptouchResult;
+import com.espressif.iot.esptouch.IEsptouchListener;
 import com.espressif.iot.esptouch.IEsptouchResult;
 import com.espressif.iot.esptouch.protocol.EsptouchGenerator;
 import com.espressif.iot.esptouch.udp.UDPSocketClient;
 import com.espressif.iot.esptouch.udp.UDPSocketServer;
 import com.espressif.iot.esptouch.util.ByteUtil;
+import com.espressif.iot.esptouch.util.EspNetUtil;
 
 import android.content.Context;
 import android.os.Looper;
@@ -16,19 +23,33 @@ import android.util.Log;
 
 public class __EsptouchTask implements __IEsptouchTask {
 
+	/**
+	 * one indivisible data contain 3 9bits info
+	 */
+	private static final int ONE_DATA_LEN = 3;
+
 	private static final String TAG = "EsptouchTask";
 
-	private volatile EsptouchResult mEsptouchResult;
+	private volatile List<IEsptouchResult> mEsptouchResultList;
 	private volatile boolean mIsSuc = false;
 	private volatile boolean mIsInterrupt = false;
 	private volatile boolean mIsExecuted = false;
 	private final UDPSocketClient mSocketClient;
 	private final UDPSocketServer mSocketServer;
 	private final String mApSsid;
+	private final String mApBssid;
+	private final boolean mIsSsidHidden;
 	private final String mApPassword;
+	private final Context mContext;
 	private AtomicBoolean mIsCancelled;
+	private IEsptouchTaskParameter mParameter;
+	private volatile Map<String, Integer> mBssidTaskSucCountMap;
+	private IEsptouchListener mEsptouchListener;
+	private Thread mTask;
 
-	public __EsptouchTask(String apSsid, String apPassword, Context context) {
+	public __EsptouchTask(String apSsid, String apBssid, String apPassword,
+			Context context, IEsptouchTaskParameter parameter,
+			boolean isSsidHidden) {
 		if (TextUtils.isEmpty(apSsid)) {
 			throw new IllegalArgumentException(
 					"the apSsid should be null or empty");
@@ -36,12 +57,77 @@ public class __EsptouchTask implements __IEsptouchTask {
 		if (apPassword == null) {
 			apPassword = "";
 		}
+		mContext = context;
 		mApSsid = apSsid;
+		mApBssid = apBssid;
 		mApPassword = apPassword;
 		mIsCancelled = new AtomicBoolean(false);
 		mSocketClient = new UDPSocketClient();
-		mSocketServer = new UDPSocketServer(PORT_LISTENING,
-				WAIT_TIMEOUT_MILLISECOND, context);
+		mParameter = parameter;
+		mSocketServer = new UDPSocketServer(mParameter.getPortListening(),
+				mParameter.getWaitUdpTotalMillisecond(), context);
+		mIsSsidHidden = isSsidHidden;
+		mEsptouchResultList = new ArrayList<IEsptouchResult>();
+		mBssidTaskSucCountMap = new HashMap<String, Integer>();
+	}
+
+	private void __putEsptouchResult(boolean isSuc, String bssid,
+			InetAddress inetAddress) {
+		synchronized (mEsptouchResultList) {
+			// check whether the result receive enough UDP response
+			boolean isTaskSucCountEnough = false;
+			Integer count = mBssidTaskSucCountMap.get(bssid);
+			if (count == null) {
+				count = 0;
+			}
+			++count;
+			if (__IEsptouchTask.DEBUG) {
+				Log.d(TAG, "__putEsptouchResult(): count = " + count);
+			}
+			mBssidTaskSucCountMap.put(bssid, count);
+			isTaskSucCountEnough = count >= mParameter
+					.getThresholdSucBroadcastCount();
+			if (!isTaskSucCountEnough) {
+				if (__IEsptouchTask.DEBUG) {
+					Log.d(TAG, "__putEsptouchResult(): count = " + count
+							+ ", isn't enough");
+				}
+				return;
+			}
+			// check whether the result is in the mEsptouchResultList already
+			boolean isExist = false;
+			for (IEsptouchResult esptouchResultInList : mEsptouchResultList) {
+				if (esptouchResultInList.getBssid().equals(bssid)) {
+					isExist = true;
+					break;
+				}
+			}
+			// only add the result who isn't in the mEsptouchResultList
+			if (!isExist) {
+				if (__IEsptouchTask.DEBUG) {
+					Log.d(TAG, "__putEsptouchResult(): put one more result");
+				}
+				final IEsptouchResult esptouchResult = new EsptouchResult(isSuc,
+						bssid, inetAddress);
+				mEsptouchResultList.add(esptouchResult);
+				if (mEsptouchListener != null) {
+					mEsptouchListener.onEsptouchResultAdded(esptouchResult);
+				}
+			}
+		}
+	}
+
+	private List<IEsptouchResult> __getEsptouchResultList() {
+		synchronized (mEsptouchResultList) {
+			if (mEsptouchResultList.isEmpty()) {
+				EsptouchResult esptouchResultFail = new EsptouchResult(false,
+						null, null);
+				esptouchResultFail.setIsCancelled(mIsCancelled.get());
+				mEsptouchResultList.add(esptouchResultFail);
+			}
+			
+			return mEsptouchResultList;
+		}
 	}
 
 	private synchronized void __interrupt() {
@@ -49,8 +135,11 @@ public class __EsptouchTask implements __IEsptouchTask {
 			mIsInterrupt = true;
 			mSocketClient.interrupt();
 			mSocketServer.interrupt();
-			// interrupt the current Thread which is used to wait for udp response 
-			Thread.currentThread().interrupt();
+			// interrupt the current Thread which is used to wait for udp response
+			if (mTask != null) {
+				mTask.interrupt();
+				mTask = null;
+			}
 		}
 	}
 
@@ -64,7 +153,7 @@ public class __EsptouchTask implements __IEsptouchTask {
 	}
 
 	private void __listenAsyn(final int expectDataLen) {
-		new Thread() {
+		mTask = new Thread() {
 			public void run() {
 				if (__IEsptouchTask.DEBUG) {
 					Log.d(TAG, "__listenAsyn() start");
@@ -72,30 +161,30 @@ public class __EsptouchTask implements __IEsptouchTask {
 				long startTimestamp = System.currentTimeMillis();
 				byte[] apSsidAndPassword = ByteUtil.getBytesByString(mApSsid
 						+ mApPassword);
-				byte expectOneByte = (byte) apSsidAndPassword.length;
+				byte expectOneByte = (byte) (apSsidAndPassword.length + 9);
+				if (__IEsptouchTask.DEBUG) {
+					Log.i(TAG, "expectOneByte: " + (0 + expectOneByte));
+				}
 				byte receiveOneByte = -1;
 				byte[] receiveBytes = null;
-				int correctBroadcastCount = 0;
-				while (correctBroadcastCount < THRESHOLD_ESPTOUCH_SUC_BROADCAST_COUNT) {
-					if (expectDataLen == ESP_TOUCH_RESULT_LEN_ONE) {
-						receiveOneByte = mSocketServer.receiveOneByte();
+				while (mEsptouchResultList.size() < mParameter
+						.getExpectTaskResultCount() && !mIsInterrupt) {
+					receiveBytes = mSocketServer
+							.receiveSpecLenBytes(expectDataLen);
+					if (receiveBytes != null) {
+						receiveOneByte = receiveBytes[0];
 					} else {
-						receiveBytes = mSocketServer
-								.receiveSpecLenBytes(expectDataLen);
-						if (receiveBytes != null) {
-							receiveOneByte = receiveBytes[0];
-						}
+						receiveOneByte = -1;
 					}
 					if (receiveOneByte == expectOneByte) {
-						correctBroadcastCount++;
 						if (__IEsptouchTask.DEBUG) {
-							Log.i(TAG, "receive " + correctBroadcastCount
-									+ " correct broadcast");
+							Log.i(TAG, "receive correct broadcast");
 						}
 						// change the socket's timeout
 						long consume = System.currentTimeMillis()
 								- startTimestamp;
-						int timeout = (int) (WAIT_TIMEOUT_MILLISECOND - consume);
+						int timeout = (int) (mParameter
+								.getWaitUdpTotalMillisecond() - consume);
 						if (timeout < 0) {
 							if (__IEsptouchTask.DEBUG) {
 								Log.i(TAG, "esptouch timeout");
@@ -107,111 +196,86 @@ public class __EsptouchTask implements __IEsptouchTask {
 										+ timeout + " milliseconds");
 							}
 							mSocketServer.setSoTimeout(timeout);
-						}
-						if (correctBroadcastCount == THRESHOLD_ESPTOUCH_SUC_BROADCAST_COUNT) {
 							if (__IEsptouchTask.DEBUG) {
-								Log.i(TAG, "receive enough correct broadcast");
+								Log.i(TAG, "receive correct broadcast");
 							}
 							if (receiveBytes != null) {
-								String mBssid = ByteUtil.parseBssid(
-										receiveBytes, ESP_TOUCH_RESULT_LEN_ONE,
-										ESP_TOUCH_RESULT_LEN - ESP_TOUCH_RESULT_LEN_ONE);
-								mEsptouchResult = new EsptouchResult(true,
-										mBssid);
+								String bssid = ByteUtil.parseBssid(
+										receiveBytes,
+										mParameter.getEsptouchResultOneLen(),
+										mParameter.getEsptouchResultMacLen());
+								InetAddress inetAddress = EspNetUtil
+										.parseInetAddr(
+												receiveBytes,
+												mParameter
+														.getEsptouchResultOneLen()
+														+ mParameter
+																.getEsptouchResultMacLen(),
+												mParameter
+														.getEsptouchResultIpLen());
+								__putEsptouchResult(true, bssid, inetAddress);
 							}
-							mIsSuc = true;
-							break;
 						}
-					}
-					else if (expectDataLen == ESP_TOUCH_RESULT_LEN_ONE
-							&& receiveOneByte == Byte.MIN_VALUE) {
-						if (__IEsptouchTask.DEBUG) {
-							Log.i(TAG, "esptouch timeout 2");
-						}
-						break;
-					} else if (expectDataLen == ESP_TOUCH_RESULT_LEN
-							&& receiveBytes == null) {
-						if (__IEsptouchTask.DEBUG) {
-							Log.i(TAG, "esptouch timeout 3");
-						}
-						break;
-					}
-					else {
+					} else {
 						if (__IEsptouchTask.DEBUG) {
 							Log.i(TAG, "receive rubbish message, just ignore");
 						}
 					}
 				}
+				mIsSuc = mEsptouchResultList.size() >= mParameter
+						.getExpectTaskResultCount();
 				__EsptouchTask.this.__interrupt();
-				if (__IEsptouchTask.DEBUG) {
-					Log.i(TAG, "esptouch finished");
-				}
 				if (__IEsptouchTask.DEBUG) {
 					Log.d(TAG, "__listenAsyn() finish");
 				}
 			}
-		}.start();
+		};
+		mTask.start();
 	}
 
-	@SuppressWarnings("unused")
 	private boolean __execute(IEsptouchGenerator generator) {
-		
+
 		long startTime = System.currentTimeMillis();
+		long currentTime = startTime;
+		long lastTime = currentTime - mParameter.getTimeoutTotalCodeMillisecond();
 
-		// send guide code
-		for (int i = 0; mIsInterrupt != true && i < REPEAT_GUIDE_CODE_TIMES; i++) {
-			if (__IEsptouchTask.DEBUG) {
-				Log.d(TAG, "send guide code " + i + " time");
-			}
-			mSocketClient.sendData(generator.getGCBytes2(), TARGET_HOSTNAME,
-					TARGET_PORT, INTERVAL_GUIDE_CODE_MILLISECOND);
-			// check whether it is timeout
-			if (System.currentTimeMillis() - startTime > TIMEOUT_MILLISECOND_GUIDE_CODE) {
+		byte[][] gcBytes2 = generator.getGCBytes2();
+		byte[][] dcBytes2 = generator.getDCBytes2();
+
+		int index = 0;
+		while (!mIsInterrupt) {
+			if (currentTime - lastTime >= mParameter.getTimeoutTotalCodeMillisecond()) {
 				if (__IEsptouchTask.DEBUG) {
-					Log.d(TAG, "send guide code enough time");
+					Log.d(TAG, "send gc code ");
 				}
+				// send guide code
+				while (!mIsInterrupt
+						&& System.currentTimeMillis() - currentTime < mParameter
+								.getTimeoutGuideCodeMillisecond()) {
+					mSocketClient.sendData(gcBytes2,
+							mParameter.getTargetHostname(),
+							mParameter.getTargetPort(),
+							mParameter.getIntervalGuideCodeMillisecond());
+					// check whether the udp is send enough time
+					if (System.currentTimeMillis() - startTime > mParameter.getWaitUdpSendingMillisecond()) {
+						break;
+					}
+				}
+				lastTime = currentTime;
+			} else {
+				mSocketClient.sendData(dcBytes2, index, ONE_DATA_LEN,
+						mParameter.getTargetHostname(),
+						mParameter.getTargetPort(),
+						mParameter.getIntervalDataCodeMillisecond());
+				index = (index + ONE_DATA_LEN) % dcBytes2.length;
+			}
+			currentTime = System.currentTimeMillis();
+			// check whether the udp is send enough time
+			if (currentTime - startTime > mParameter.getWaitUdpSendingMillisecond()) {
 				break;
 			}
 		}
 
-		// send magic code
-		for (int i = 0; mIsInterrupt != true && i < REPEAT_MAGIC_CODE_TIMES; i++) {
-			if (__IEsptouchTask.DEBUG) {
-				Log.d(TAG, "send magic code " + i + " time");
-			}
-			mSocketClient.sendData(generator.getMCBytes2(), TARGET_HOSTNAME,
-					TARGET_PORT, INTERVAL_MAGIC_CODE_MILLISECOND);
-		}
-
-		// send prefix code
-		for (int i = 0; mIsInterrupt != true && i < REPEAT_PREFIX_CODE_TIMES; i++) {
-			if (__IEsptouchTask.DEBUG) {
-				Log.d(TAG, "send prefix code " + i + " time");
-			}
-			mSocketClient.sendData(generator.getPCBytes2(), TARGET_HOSTNAME,
-					TARGET_PORT, INTERVAL_PREFIX_CODE_MILLISECOND);
-		}
-
-		// send data code
-		for (int i = 0; mIsInterrupt != true && i < REPEAT_DATA_CODE_TIMES; i++) {
-			// it must be interrupted when mSocketServer receiving the feedback
-			// from the device or timeout
-			if (__IEsptouchTask.DEBUG) {
-				Log.d(TAG, "send data code " + i + " time");
-			}
-			mSocketClient.sendData(generator.getDCBytes2(), TARGET_HOSTNAME,
-					TARGET_PORT, INTERVAL_PREFIX_CODE_MILLISECOND);
-			// check whether it is timeout
-			if (System.currentTimeMillis() - startTime > TIMEOUT_MILLISECOND_ONCE) {
-				if (__IEsptouchTask.DEBUG) {
-					Log.d(TAG, "send data code enough time");
-				}
-				break;
-			}
-		}
-		if (__IEsptouchTask.DEBUG && !mIsCancelled.get()) {
-			Log.i(TAG, "__execute() finished, the result is " + mIsSuc);
-		}
 		return mIsSuc;
 	}
 
@@ -223,102 +287,71 @@ public class __EsptouchTask implements __IEsptouchTask {
 		}
 		this.mIsExecuted = true;
 	}
-	
-	@Override
-	public boolean execute() throws RuntimeException {
-		
-		__checkTaskValid();
-		
-		if (__IEsptouchTask.DEBUG) {
-			Log.d(TAG, "execute()");
-		}
-		if (Looper.myLooper() == Looper.getMainLooper()) {
-			throw new RuntimeException(
-					"Don't call the esptouch Task at Main(UI) thread directly.");
-		}
-		// generator the esptouch byte[][] to be transformed, which will cost
-		// some time(maybe a bit much)
-		IEsptouchGenerator generator = new EsptouchGenerator(mApSsid,
-				mApPassword);
-		// listen the esptouch result asyn
-		__listenAsyn(ESP_TOUCH_RESULT_LEN_ONE);
-		boolean isSuc = false;
-		for (int i = 0; i < TOTAL_REPEAT_TIME; i++) {
-			isSuc = __execute(generator);
-			if (isSuc) {
-				return mIsSuc;
-			}
-		}
-		// wait the udp response without sending udp broadcast
-		try {
-			Thread.sleep(WAIT_UDP_RESPONSE_MILLISECOND);
-		} catch (InterruptedException e) {
-			// receive the udp broadcast or the user interrupt the task
-			if (this.mIsSuc)
-			{
-				return mIsSuc;
-			}
-			else
-			{
-				this.__interrupt();
-				return false;
-			}
-		}
-		this.__interrupt();
-		return false;
-	}
 
 	@Override
 	public IEsptouchResult executeForResult() throws RuntimeException {
-		
-		__checkTaskValid();
-		
-		if (__IEsptouchTask.DEBUG) {
-			Log.d(TAG, "execute()");
-		}
-		if (Looper.myLooper() == Looper.getMainLooper()) {
-			throw new RuntimeException(
-					"Don't call the esptouch Task at Main(UI) thread directly.");
-		}
-		// generator the esptouch byte[][] to be transformed, which will cost
-		// some time(maybe a bit much)
-		IEsptouchGenerator generator = new EsptouchGenerator(mApSsid,
-				mApPassword);
-		// listen the esptouch result asyn
-		__listenAsyn(ESP_TOUCH_RESULT_LEN);
-		EsptouchResult esptouchResultFail = new EsptouchResult(false, null);
-		boolean isSuc = false;
-		for (int i = 0; i < TOTAL_REPEAT_TIME; i++) {
-			isSuc = __execute(generator);
-			if (isSuc) {
-				mEsptouchResult.setIsCancelled(mIsCancelled.get());
-				return mEsptouchResult;
-			}
-		}
-		// wait the udp response without sending udp broadcast
-		try {
-			Thread.sleep(WAIT_UDP_RESPONSE_MILLISECOND);
-		} catch (InterruptedException e) {
-			// receive the udp broadcast or the user interrupt the task
-			if (this.mIsSuc)
-			{
-				return mEsptouchResult;
-			}
-			else
-			{
-				this.__interrupt();
-				esptouchResultFail.setIsCancelled(mIsCancelled.get());
-				return esptouchResultFail;
-			}
-		}
-		this.__interrupt();
-		esptouchResultFail.setIsCancelled(mIsCancelled.get());
-		return esptouchResultFail;
+		return executeForResults(1).get(0);
 	}
 
 	@Override
 	public boolean isCancelled() {
 		return this.mIsCancelled.get();
+	}
+
+	@Override
+	public List<IEsptouchResult> executeForResults(int expectTaskResultCount)
+			throws RuntimeException {
+		__checkTaskValid();
+
+		mParameter.setExpectTaskResultCount(expectTaskResultCount);
+
+		if (__IEsptouchTask.DEBUG) {
+			Log.d(TAG, "execute()");
+		}
+		if (Looper.myLooper() == Looper.getMainLooper()) {
+			throw new RuntimeException(
+					"Don't call the esptouch Task at Main(UI) thread directly.");
+		}
+		InetAddress localInetAddress = EspNetUtil.getLocalInetAddress(mContext);
+		if (__IEsptouchTask.DEBUG) {
+			Log.i(TAG, "localInetAddress: " + localInetAddress);
+		}
+		// generator the esptouch byte[][] to be transformed, which will cost
+		// some time(maybe a bit much)
+		IEsptouchGenerator generator = new EsptouchGenerator(mApSsid, mApBssid,
+				mApPassword, localInetAddress, mIsSsidHidden);
+		// listen the esptouch result asyn
+		__listenAsyn(mParameter.getEsptouchResultTotalLen());
+		boolean isSuc = false;
+		for (int i = 0; i < mParameter.getTotalRepeatTime(); i++) {
+			isSuc = __execute(generator);
+			if (isSuc) {
+				return __getEsptouchResultList();
+			}
+		}
+
+		if (!mIsInterrupt) {
+			// wait the udp response without sending udp broadcast
+			try {
+				Thread.sleep(mParameter.getWaitUdpReceivingMillisecond());
+			} catch (InterruptedException e) {
+				// receive the udp broadcast or the user interrupt the task
+				if (this.mIsSuc) {
+					return __getEsptouchResultList();
+				} else {
+					this.__interrupt();
+					return __getEsptouchResultList();
+				}
+			}
+			this.__interrupt();
+		}
+		
+		return __getEsptouchResultList();
+	}
+
+	@Override
+	public void setEsptouchListener(IEsptouchListener esptouchListener) {
+		mEsptouchListener = esptouchListener;
 	}
 
 }
