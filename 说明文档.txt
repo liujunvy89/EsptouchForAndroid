@@ -1,0 +1,3 @@
+物联网WIFI一键配置的代码。适用于ESP8266 smartconfig. 包内有完整可编译过IOS代码和Android代码。
+基本原理是ESP8266会搜索当前所有AP及其CHANNEL，并且轮流监听这些CHANNEL。直到收到手机端UDP广播出来的、含SSID及密码的包。就自动连上指定AP。
+本例程适合学习使用。仅转发同分享学习
